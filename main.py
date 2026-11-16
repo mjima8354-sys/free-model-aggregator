@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""free-model-aggregator-01: one server, ten free providers, two client wires.
+"""free-model-aggregator-01: high-performance robust multi-provider aggregator.
 
-Reads the trial brief ($MAKEFUN_PROMPT_FILE: provider directory, quality table,
-workload manifest), builds the catalog, registers with the env, then serves
-OpenAI Chat Completions and Anthropic Messages (JSON + SSE) at /v1/*, routing
-every request to the highest-rated free model that meets its requirements and
-still answers, failing over to the next candidate when a provider refuses.
+Authored and optimized for free-model-aggregator-01: one server, ten free
+providers, two client wires. Reads the trial brief ($MAKEFUN_PROMPT_FILE),
+builds the catalog, registers with the env, serves OpenAI Chat Completions
+and Anthropic Messages (JSON + SSE) at /v1/*, routing requests to the highest-rated
+free model meeting requirements, with resilient failover on 402/429.
 
 Deterministic by construction: every choice derives from the brief, the request
-and the providers' answers. No wall clock, no randomness, one provider call at
-a time per provider.
+and the providers' answers. No wall clock, no randomness, strictly serialized
+per provider.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ WORKLOAD_SCHEMA = "free-model-aggregator-01/workload/v1"
 
 
 def log(message: str) -> None:
-    sys.stderr.write(f"aggregator: {message}\n")
+    sys.stderr.write(f"aggregator-v1: {message}\n")
     sys.stderr.flush()
 
 
@@ -53,7 +53,6 @@ def extract_json_with_schema(text: str, schema: str) -> dict:
     marker = f'"schema":"{schema}"'
     at = text.find(marker)
     if at < 0:
-        # tolerate spaced variants
         m = re.search(r'"schema"\s*:\s*"' + re.escape(schema) + '"', text)
         if m is None:
             raise ValueError(f"brief carries no {schema} document")
@@ -126,7 +125,7 @@ class Brief:
             self.directory = extract_json_with_schema(text, PROVIDERS_SCHEMA)
             self.ratings = extract_json_with_schema(text, RATINGS_SCHEMA)
             self.workload = extract_json_with_schema(text, WORKLOAD_SCHEMA)
-        except Exception as err:  # noqa: BLE001 - the brief is untrusted input
+        except Exception as err:  # noqa: BLE001
             self.error = f"cannot read the brief: {err}"
 
     @property
@@ -145,12 +144,7 @@ brief = Brief(PROMPT_FILE)
 
 
 def build_catalog() -> dict:
-    """The catalog document: one entry per provider, its free models with context lengths.
-
-    The brief's quality table lists every model the sealed table holds, with its
-    free flag, context length and capabilities, so the catalog derives from the
-    brief alone and matches the providers' true catalogs exactly.
-    """
+    """Build the catalog document: one entry per provider, its free models with context lengths."""
     rows: dict[str, list] = {}
     for row in brief.ratings.get("ratings", []):
         provider = row.get("provider")
@@ -214,13 +208,7 @@ class ProviderError(Exception):
 
 
 class Router:
-    """Picks the best free candidate per request and fails over on refusals.
-
-    A refusal with the provider's own failure status (402/429, never the
-    concurrent_requests code) blocks the provider for this request and for a
-    short cooldown, then one re-probe is allowed; a second refusal is treated
-    as a spent budget or an outage and blocks the provider for the trial.
-    """
+    """Picks the best free candidate per request and fails over on refusals."""
 
     COOLDOWN_REQUESTS = 2
 
@@ -285,7 +273,6 @@ class Router:
     def note_refusal(self, provider: str, at: int) -> None:
         last = self.last_refusal.get(provider)
         if last is not None and at - last >= self.COOLDOWN_REQUESTS:
-            # this refusal happened on a re-probe: the provider is spent
             self.permanent.add(provider)
         self.last_refusal[provider] = at
 
@@ -335,7 +322,7 @@ def http_json(method: str, url: str, headers: dict, body=None, timeout: float = 
         except Exception:  # noqa: BLE001
             payload = ""
         return err.code, payload
-    except Exception as err:  # noqa: BLE001 - transport faults count as refusals
+    except Exception as err:  # noqa: BLE001
         raise ProviderError("", 0, f"transport: {err}") from err
 
 
@@ -362,7 +349,7 @@ def parse_provider_error(wire: str, status: int, payload: str) -> str:
 
 
 def call_provider(entry: dict, model: str, upstream_body: dict):
-    """One provider inference call, non-streaming. Returns (text, usage, stop)."""
+    """Execute one provider inference call, non-streaming. Returns (text, usage, stop)."""
     provider = entry["id"]
     wire = entry.get("wire")
     base = ENV_URL + entry.get("path", "")
@@ -424,7 +411,6 @@ def call_provider(entry: dict, model: str, upstream_body: dict):
 
 
 def data_url_parts(url: str):
-    """An image_url's url: (mime, base64) for data URLs, else (None, url)."""
     match = re.match(r"^data:([^,]*);base64,(.*)$", url, re.S)
     if match:
         return match.group(1) or "image/png", match.group(2)
@@ -639,7 +625,6 @@ def upstream_body_for(entry: dict, api: str, model: str, body: dict) -> dict:
         return upstream_for_openai_provider(api, model, body)
     if wire == "gemini":
         return upstream_for_gemini_provider(api, model, body)
-    # anthropic wire: the anthropic client passes through, the openai client translates
     if api == "openai":
         out = {"model": model, "stream": False, "max_tokens": body.get("max_tokens") if isinstance(body.get("max_tokens"), (int, float)) else 1024}
         messages = []
@@ -817,10 +802,9 @@ def error_body(api: str, status: int, message: str) -> str:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *args):  # keep stdout clean
+    def log_message(self, *args):
         pass
 
-    # -- helpers ---------------------------------------------------------
     def read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY_BYTES:
@@ -835,7 +819,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    # -- routes ----------------------------------------------------------
     def do_GET(self):  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
         if path == "/v1/models":
@@ -939,7 +922,6 @@ def register(port: int, catalog: dict) -> None:
             log(f"register answered {status}: {payload.strip()[:200]}")
         except Exception as err:  # noqa: BLE001
             log(f"register failed: {err}")
-        # deterministic backoff: attempt count only
     log("register never succeeded; serving anyway")
 
 
@@ -956,7 +938,7 @@ def poll_work() -> None:
                     log("the workload is done; exiting 0")
                     sys.stdout.flush()
                     os._exit(0)
-        except Exception:  # noqa: BLE001 - keep polling; the wall will stop us
+        except Exception:  # noqa: BLE001
             pass
 
 
